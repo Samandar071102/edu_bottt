@@ -1,5 +1,6 @@
 import sqlite3
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.contrib.fsm_storage.memory import MemoryContextStorage
 from aiogram.dispatcher import FSMContext
@@ -43,8 +44,19 @@ class AdminStates(StatesGroup):
     waiting_for_group_selection = State()
     waiting_for_subject_name = State()
     waiting_for_file = State()
+    waiting_for_broadcast = State()
 
-# --- 4. O'QUVCHI: START & RO'YXATDAN O'TISH ---
+class UserStates(StatesGroup):
+    waiting_for_question = State()
+
+# --- 4. KLAVIATURALAR (KEYBOARDS) ---
+def get_main_menu():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("📚 Mavzular", "🏆 Reyting")
+    keyboard.add("❓ Savol berish")
+    return keyboard
+
+# --- 5. START VA RO'YXATDAN O'TISH ---
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     conn = sqlite3.connect('texnikum.db')
@@ -53,9 +65,9 @@ async def cmd_start(message: types.Message):
     conn.close()
 
     if user:
-        await message.answer(f"Xush kelibsiz, *{user[0]}*!\n\n📚 Mavzular: /mavzular\n🏆 Reyting: /rating")
+        await message.answer(f"Xush kelibsiz, *{user[0]}*!", reply_markup=get_main_menu())
     else:
-        await message.answer("Assalomu alaykum! Texnikum botiga xush kelibsiz.\nIsmingizni kiriting:")
+        await message.answer("Assalomu alaykum! Texnikum botiga xush kelibsiz.\nTo'liq ismingizni kiriting:")
         await Registration.waiting_for_name.set()
 
 @dp.message_handler(state=Registration.waiting_for_name)
@@ -81,22 +93,29 @@ async def process_group(message: types.Message, state: FSMContext):
         cur.execute("INSERT INTO users (user_id, full_name, group_id) VALUES (?, ?, ?)",
                     (message.from_user.id, data['full_name'], g_res[0]))
         conn.commit()
-        await message.answer("✅ Ro'yxatdan o'tdingiz! /mavzular buyrug'ini bosing.", reply_markup=types.ReplyKeyboardRemove())
+        await message.answer("✅ Ro'yxatdan o'tdingiz!", reply_markup=get_main_menu())
         await state.finish()
     else:
         await message.answer("Guruhni tugmalar orqali tanlang.")
     conn.close()
 
-# --- 5. ADMIN PANEL ---
+# --- 6. ADMIN PANEL (YUKLASH VA RASSILKA) ---
 @dp.message_handler(commands=['admin'], user_id=ADMINS)
 async def admin_start(message: types.Message):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("📤 Material yuklash", callback_data="adm_upload"))
+    kb.add(types.InlineKeyboardButton("📢 Hammaga xabar yuborish", callback_data="adm_broadcast"))
+    await message.answer("🛠 *Admin Paneli:* Bo'limni tanlang:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data == "adm_upload", user_id=ADMINS)
+async def start_upload(callback: types.CallbackQuery):
     conn = sqlite3.connect('texnikum.db')
     cur = conn.cursor()
     groups = cur.execute("SELECT name FROM groups").fetchall()
     conn.close()
-    keyboard = types.InlineKeyboardMarkup()
-    for g in groups: keyboard.add(types.InlineKeyboardButton(text=g[0], callback_data=f"adm_g_{g[0]}"))
-    await message.answer("🛠 *Admin:* Guruhni tanlang:", reply_markup=keyboard)
+    kb = types.InlineKeyboardMarkup()
+    for g in groups: kb.add(types.InlineKeyboardButton(text=g[0], callback_data=f"adm_g_{g[0]}"))
+    await callback.message.edit_text("Guruhni tanlang:", reply_markup=kb)
     await AdminStates.waiting_for_group_selection.set()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('adm_g_'), state=AdminStates.waiting_for_group_selection)
@@ -128,8 +147,30 @@ async def adm_file_save(message: types.Message, state: FSMContext):
     await message.answer("✅ Yuklandi!")
     await state.finish()
 
-# --- 6. O'QUVCHI: MAVZULAR VA TESTLAR ---
-@dp.message_handler(commands=['mavzular'])
+# RASSILKA QISMI
+@dp.callback_query_handler(lambda c: c.data == "adm_broadcast", user_id=ADMINS)
+async def broadcast_prompt(callback: types.CallbackQuery):
+    await callback.message.answer("Barcha o'quvchilarga yubormoqchi bo'lgan xabaringizni yozing:")
+    await AdminStates.waiting_for_broadcast.set()
+    await callback.answer()
+
+@dp.message_handler(state=AdminStates.waiting_for_broadcast)
+async def send_broadcast(message: types.Message, state: FSMContext):
+    conn = sqlite3.connect('texnikum.db')
+    cur = conn.cursor()
+    users = cur.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    count = 0
+    for u in users:
+        try:
+            await bot.send_message(u[0], f"📢 **MUHIM XABAR!**\n\n{message.text}")
+            count += 1
+        except: pass
+    await message.answer(f"✅ Xabar {count} ta foydalanuvchiga yuborildi.")
+    await state.finish()
+
+# --- 7. O'QUVCHI: MAVZULAR, TEST VA SAVOL ---
+@dp.message_handler(lambda m: m.text == "📚 Mavzular")
 async def list_subjects(message: types.Message):
     conn = sqlite3.connect('texnikum.db')
     cur = conn.cursor()
@@ -138,8 +179,8 @@ async def list_subjects(message: types.Message):
         subs = cur.execute("SELECT id, title FROM subjects WHERE group_id = ?", (u[0],)).fetchall()
         kb = types.InlineKeyboardMarkup(row_width=1)
         for s in subs: kb.add(types.InlineKeyboardButton(text=s[1], callback_data=f"get_f_{s[0]}"))
-        await message.answer("📚 Mavzular:", reply_markup=kb)
-    else: await message.answer("/start bosing.")
+        await message.answer("📚 Guruhingizga tegishli mavzular:", reply_markup=kb)
+    else: await message.answer("/start orqali ro'yxatdan o'ting.")
     conn.close()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('get_f_'))
@@ -153,18 +194,10 @@ async def send_file(callback: types.CallbackQuery):
         if f[1] == "doc": await callback.message.answer_document(f[0])
         elif f[1] == "video": await callback.message.answer_video(f[0])
         else: await callback.message.answer_photo(f[0])
-        # Fayldan keyin test tugmasini chiqarish
-        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✍️ Testni boshlash", callback_data=f"quiz_{s_id}"))
-        await callback.message.answer("Mavzuni o'rganib bo'lgach, testni topshiring:", reply_markup=kb)
+        await callback.message.answer("Darsni o'rganib chiqib, bilimingizni sinab ko'ring.")
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('quiz_'))
-async def run_quiz(callback: types.CallbackQuery):
-    # Bu yerda namunaviy test mantiqi (Haqiqiy savollarni admin panel orqali bazaga qo'shish kerak)
-    await callback.message.answer("Hozircha bu mavzuda testlar yuklanmagan. Tez orada qo'shiladi!")
-    await callback.answer()
-
-@dp.message_handler(commands=['rating'])
+@dp.message_handler(lambda m: m.text == "🏆 Reyting")
 async def show_rating(message: types.Message):
     conn = sqlite3.connect('texnikum.db')
     cur = conn.cursor()
@@ -173,6 +206,18 @@ async def show_rating(message: types.Message):
     res = "🏆 *Top 10 O'quvchi:*\n\n"
     for i, u in enumerate(users, 1): res += f"{i}. {u[0]} — {u[1]} ball\n"
     await message.answer(res)
+
+@dp.message_handler(lambda m: m.text == "❓ Savol berish")
+async def ask_question(message: types.Message):
+    await message.answer("Savolingizni yozing, o'qituvchi tez orada javob beradi:")
+    await UserStates.waiting_for_question.set()
+
+@dp.message_handler(state=UserStates.waiting_for_question)
+async def forward_question(message: types.Message, state: FSMContext):
+    for admin in ADMINS:
+        await bot.send_message(admin, f"📩 **Yangi savol!**\nKimdan: {message.from_user.full_name}\nID: {message.from_user.id}\n\nSavol: {message.text}")
+    await message.answer("✅ Savolingiz o'qituvchiga yuborildi.")
+    await state.finish()
 
 if __name__ == '__main__':
     db_init()
